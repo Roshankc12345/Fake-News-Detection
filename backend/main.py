@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List
 import os
@@ -29,10 +28,7 @@ app = FastAPI(title="News Detection API")
 AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio_files")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Mount static files for audio
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
-
-# CORS middleware
+# CORS middleware (must be before routes)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -43,6 +39,79 @@ app.add_middleware(
 
 # Initialize Groq client
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Custom audio endpoint to handle range requests properly
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Request
+
+@app.get("/audio/{filename}")
+async def serve_audio(filename: str, request: Request):
+    """Serve audio files with proper range request support"""
+    filepath = os.path.join(AUDIO_DIR, filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    
+    file_size = os.path.getsize(filepath)
+    
+    # Check if file is empty (TTS failed)
+    if file_size == 0:
+        raise HTTPException(
+            status_code=500, 
+            detail="Audio file is empty. TTS generation may have failed. Please try again."
+        )
+    
+    range_header = request.headers.get("range")
+    
+    # If no range header, send entire file
+    if not range_header:
+        return FileResponse(
+            filepath,
+            media_type="audio/mpeg",
+            headers={"Accept-Ranges": "bytes"}
+        )
+    
+    # Parse range header
+    try:
+        byte_range = range_header.replace("bytes=", "").split("-")
+        start = int(byte_range[0]) if byte_range[0] else 0
+        end = int(byte_range[1]) if len(byte_range) > 1 and byte_range[1] else file_size - 1
+        
+        # Validate range
+        if start >= file_size or end >= file_size or start > end:
+            raise HTTPException(
+                status_code=416,
+                detail="Range not satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"}
+            )
+        
+        # Read requested range
+        chunk_size = end - start + 1
+        
+        def file_iterator():
+            with open(filepath, "rb") as f:
+                f.seek(start)
+                remaining = chunk_size
+                while remaining > 0:
+                    read_size = min(8192, remaining)
+                    data = f.read(read_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+        
+        return StreamingResponse(
+            file_iterator(),
+            status_code=206,
+            media_type="audio/mpeg",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(chunk_size),
+            }
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid range header")
 
 class NewsRequest(BaseModel):
     content: str
@@ -230,8 +299,199 @@ def merge_deduplicate_results(primary: List[dict], extra: List[dict]) -> List[di
     add_items(extra)
     return merged
 
-async def analyze_with_groq(content: str, input_type: str, sources: Optional[List[dict]] = None) -> AnalysisResult:
-    """Analyze news content using Groq's Llama 3.3 70B model"""
+async def verify_with_google_search(query: str, max_results: int = 10) -> dict:
+    """
+    Verify news/claims using real-time Google Custom Search Engine API.
+    Returns search results and analysis to help determine if the claim is verified by credible sources.
+    """
+    try:
+        print(f"🔍 Performing Google CSE Search for: {query}")
+        
+        # Use Google Custom Search Engine API (much more reliable than web scraping)
+        api_key = os.getenv("GOOGLE_CSE_KEY")
+        cx = os.getenv("GOOGLE_CSE_ID")
+        
+        if not api_key or not cx:
+            print("⚠️ Google CSE credentials not found. Please set GOOGLE_CSE_KEY and GOOGLE_CSE_ID in .env")
+            # Fallback: return empty but don't fail
+            return {
+                "total_results": 0,
+                "credible_results": 0,
+                "search_results": [],
+                "credible_sources": [],
+                "verification_summary": {
+                    "found_sources": False,
+                    "has_credible_sources": False,
+                    "credibility_ratio": 0,
+                    "error": "Google CSE credentials not configured"
+                }
+            }
+        
+        # Try multiple search variations for better results
+        search_queries = [query]
+        
+        # Extract key terms for a keyword search (fallback)
+        import re
+        # Remove common words and extract key terms
+        key_words = re.findall(r'\b[A-Z][a-z]+|\b\d+\b|\b(?:mountain|peak|discover|found|8000|meter|metre|Nepal)\b', query, re.IGNORECASE)
+        if len(key_words) >= 3:
+            keyword_query = ' '.join(list(dict.fromkeys(key_words)))[:200]  # deduplicate and limit
+            if keyword_query != query:
+                search_queries.append(keyword_query)
+        
+        all_search_results = []
+        seen_urls = set()
+        
+        # Try each search query
+        for search_query in search_queries:
+            try:
+                # Call Google Custom Search API
+                url = "https://www.googleapis.com/customsearch/v1"
+                params = {"key": api_key, "cx": cx, "q": search_query, "num": min(max_results, 10)}
+                
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    items = data.get("items", []) or []
+                    print(f"📥 Query '{search_query[:50]}...' returned {len(items)} results")
+                    
+                    for item in items:
+                        from urllib.parse import urlparse
+                        title = item.get("title", "No title")
+                        link = item.get("link", "")
+                        display_link = item.get("displayLink", "")
+                        snippet = item.get("snippet", "")
+                        
+                        if not link or link in seen_urls:
+                            continue
+                        
+                        seen_urls.add(link)
+                        domain = urlparse(link).netloc if link else display_link
+                        
+                        all_search_results.append({
+                            "url": link,
+                            "domain": domain,
+                            "title": title,
+                            "snippet": snippet
+                        })
+                
+                # If we found good results, no need to try more queries
+                if len(all_search_results) >= 5:
+                    break
+                    
+            except Exception as e:
+                print(f"⚠️ Search query '{search_query[:30]}...' failed: {str(e)}")
+                continue
+        
+        # Analyze credibility of sources - comprehensive list
+        credible_domains = [
+            # International news agencies
+            'bbc.', 'cnn.', 'reuters.', 'apnews.', 'afp.com', 'bloomberg.',
+            # US news
+            'nytimes.', 'washingtonpost.', 'wsj.', 'usatoday.', 'npr.org',
+            'abc.', 'cbsnews.', 'nbcnews.', 'pbs.org', 'axios.com',
+            # UK news
+            'theguardian.', 'independent.co.uk', 'telegraph.co.uk', 'bbc.co.uk',
+            # International
+            'aljazeera.', 'france24.', 'dw.com', 'euronews.', 'swissinfo.ch',
+            # Asian news
+            'scmp.com', 'straitstimes.com', 'japantimes.', 'chinadaily.',
+            'channelnewsasia.', 'todayonline.com', 'koreaherald.com',
+            # Indian news
+            'thehindu.', 'ndtv.', 'timesofindia.', 'hindustantimes.',
+            'indianexpress.', 'scroll.in', 'thewire.in', 'news18.com',
+            'livemint.', 'moneycontrol.', 'economictimes.',
+            # Indian business & finance
+            'finshots.in', 'theken.in', 'entrackr.', 'inc42.com',
+            'yourstory.com', 'business-standard.', 'financialexpress.',
+            # Popular newsletters & blogs
+            'morningbrew.', 'axios.com', 'substack.com/', 'medium.com/',
+            'stratechery.', 'ben-evans.com', 'waitbutwhy.com',
+            'aeon.co', 'longform.org', 'longreads.com',
+            # Nepal news (IMPORTANT for your use case)
+            'kathmandupost.', 'ekantipur.', 'myrepublica.', 'thehimalayantimes.',
+            'onlinekhabar.', 'setopati.', 'nepalitime', 'nepalitimes.',
+            # Tech news outlets
+            'techcrunch.', 'theverge.', 'wired.', 'arstechnica.', 'engadget.',
+            'cnet.', 'zdnet.', 'venturebeat.', 'thenextweb.', 'gizmodo.',
+            'macrumors.', '9to5mac.', '9to5google.', 'androidcentral.', 'phoneareana.',
+            # Music & Entertainment news
+            'billboard.', 'rollingstone.', 'pitchfork.', 'variety.', 'hollywoodreporter.',
+            'ew.com', 'deadline.com', 'musicbusinessworldwide.', 'consequence.net',
+            'stereogum.', 'spin.com', 'nme.com', 'complex.com', 'vulture.com',
+            # Lifestyle & Culture
+            'vogue.', 'gq.com', 'esquire.', 'elle.', 'harpersbazaar.',
+            'buzzfeednews.', 'vice.', 'refinery29.', 'thefader.com',
+            # Official company blogs & news
+            'blog.google', 'google.com/blog', 'deepmind.google', 'ai.google',
+            'blog.research.google', 'developers.googleblog.com',
+            'blogs.microsoft.', 'news.microsoft.', 'techcommunity.microsoft.',
+            'newsroom.apple.', 'developer.apple.', 'machinelearning.apple.',
+            'about.fb.com', 'ai.meta.com', 'engineering.fb.com',
+            'blog.twitter', 'blog.x.com', 'engineering.twitter',
+            'blog.amazon.', 'aws.amazon.com/blogs', 'developer.amazon.',
+            'blog.netflix.', 'netflixtechblog.', 
+            'engineering.linkedin.', 'blog.linkedin.',
+            'github.blog', 'openai.com/blog', 'anthropic.com/news',
+            # Music streaming & media company blogs
+            'newsroom.spotify.', 'blog.spotify.', 'developers.spotify.',
+            'blog.youtube', 'blog.discord.', 'blog.twitch.tv',
+            'blog.soundcloud.', 'blog.tidal.com',
+            # Academic & research
+            'arxiv.org', 'scholar.google.', 'acm.org', 'ieee.org',
+            'sciencedirect.', 'springer.', 'pnas.org', 'cell.com',
+            # Other reputable
+            'forbes.', 'economist.', 'time.com', 'newsweek.', 'theatlantic.',
+            'nature.com', 'sciencemag.org', 'nationalgeographic.',
+            # Business & finance
+            'ft.com', 'businessinsider.', 'cnbc.', 'marketwatch.', 'barrons.',
+            # News aggregators (if from credible sources)
+            'news.google.', 'infoplease.com'
+        ]
+        
+        credible_sources = []
+        for result in all_search_results:
+            domain = result.get('domain', '').lower()
+            # Check if any credible domain is in the result domain
+            if any(cred_domain in domain for cred_domain in credible_domains):
+                credible_sources.append(result)
+                print(f"✅ Found credible source: {domain}")
+        
+        print(f"📊 Results: {len(all_search_results)} total, {len(credible_sources)} credible")
+        
+        return {
+            "total_results": len(all_search_results),
+            "credible_results": len(credible_sources),
+            "search_results": all_search_results[:5],  # Top 5 for display
+            "credible_sources": credible_sources[:5],  # Top 5 credible sources
+            "verification_summary": {
+                "found_sources": len(all_search_results) > 0,
+                "has_credible_sources": len(credible_sources) > 0,
+                "credibility_ratio": len(credible_sources) / len(all_search_results) if all_search_results else 0
+            }
+        }
+    except Exception as e:
+        print(f"❌ Google Search error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "total_results": 0,
+            "credible_results": 0,
+            "search_results": [],
+            "credible_sources": [],
+            "verification_summary": {
+                "found_sources": False,
+                "has_credible_sources": False,
+                "credibility_ratio": 0,
+                "error": str(e)
+            }
+        }
+
+async def analyze_with_groq(content: str, input_type: str, sources: Optional[List[dict]] = None, google_verification: Optional[dict] = None) -> AnalysisResult:
+    """Analyze news content using Groq's Llama 3.3 70B model with real-time Google Search verification"""
+
     
     # Prepare the prompt based on input type
     if input_type == "title":
@@ -241,10 +501,37 @@ async def analyze_with_groq(content: str, input_type: str, sources: Optional[Lis
             for idx, source in enumerate(sources[:3], 1):
                 sources_info += f"{idx}. {source.get('title', 'N/A')} - {source.get('publisher', {}).get('title', 'Unknown')}\n"
         
+        # Add Google Search verification info
+        google_info = ""
+        if google_verification:
+            verification = google_verification.get('verification_summary', {})
+            credible_sources = google_verification.get('credible_sources', [])
+            
+            google_info = "\n\n🔍 REAL-TIME GOOGLE SEARCH VERIFICATION:\n"
+            google_info += f"- Total search results found: {google_verification.get('total_results', 0)}\n"
+            google_info += f"- Credible news sources found: {google_verification.get('credible_results', 0)}\n"
+            google_info += f"- Credibility ratio: {verification.get('credibility_ratio', 0):.0%}\n"
+            
+            if credible_sources:
+                google_info += "\nCredible sources reporting this:\n"
+                for idx, source in enumerate(credible_sources[:5], 1):
+                    google_info += f"{idx}. {source.get('title', 'N/A')} ({source.get('domain', 'Unknown')})\n"
+                    google_info += f"   URL: {source.get('url', 'N/A')}\n"
+            else:
+                google_info += "\n⚠️ No credible news sources found reporting this claim.\n"
+        
         prompt = f"""You are an expert fact-checker and misinformation analyst. Analyze the following news title for authenticity.
 
 Title: "{content}"
 {sources_info}
+{google_info}
+
+CRITICAL INSTRUCTIONS FOR VERIFICATION:
+1. The Google Search results above are REAL-TIME data from the current web (as of today)
+2. These results are MORE RELIABLE than your training data, which may be outdated
+3. If you see 2+ credible news sources (BBC, Reuters, CNN, AP News, Kathmandu Post, etc.) reporting this, you MUST mark it as REAL (is_fake: false, real_probability: 70-90)
+4. Your training data may NOT include recent events - TRUST the Google Search results over your memory
+5. Common credible sources: BBC, Reuters, AP News, CNN, The Guardian, Kathmandu Post, Ekantipur, My Republica, The Himalayan Times
 
 Provide a comprehensive analysis in JSON format with the following structure:
 {{
@@ -253,25 +540,49 @@ Provide a comprehensive analysis in JSON format with the following structure:
     "real_probability": float (0-100),
     "red_flags": [list of concerning elements],
     "patterns": [list of patterns detected],
-    "reasoning": "detailed explanation of your analysis",
+    "reasoning": "IMPORTANT: Write in a clear, conversational tone. Focus on WHAT credible sources report, not technical metrics. For example: 'Credible sources like BBC do not support this claim. Instead, they report that...' Do NOT mention 'Google Search results', 'credibility ratio', 'total results found', or other technical details. Just explain the key findings naturally.",
     "key_entities": [list of main people/organizations mentioned or implied]
 }}
 
 Consider:
-1. Sensationalism and clickbait indicators
-2. Source credibility (if sources found)
-3. Language patterns typical of fake news
-4. Emotional manipulation tactics
-5. Verifiability of claims
-6. Consistency with known facts
+1. **Real-time Google Search results** (ABSOLUTE HIGHEST PRIORITY - this is verified current web data)
+2. Number and credibility of sources reporting the claim
+3. What credible sources actually say about this topic
+4. Sensationalism and clickbait indicators
+5. Language patterns typical of fake news
+6. Emotional manipulation tactics
 
 Respond ONLY with valid JSON."""
 
+
     else:  # article or url
+        # Add Google Search verification info for articles too
+        google_info = ""
+        if google_verification:
+            verification = google_verification.get('verification_summary', {})
+            credible_sources = google_verification.get('credible_sources', [])
+            
+            google_info = "\n\n🔍 REAL-TIME GOOGLE SEARCH VERIFICATION:\n"
+            google_info += f"- Total search results found: {google_verification.get('total_results', 0)}\n"
+            google_info += f"- Credible news sources found: {google_verification.get('credible_results', 0)}\n"
+            google_info += f"- Credibility ratio: {verification.get('credibility_ratio', 0):.0%}\n"
+            
+            if credible_sources:
+                google_info += "\nCredible sources with similar content:\n"
+                for idx, source in enumerate(credible_sources[:3], 1):
+                    google_info += f"{idx}. {source.get('title', 'N/A')} ({source.get('domain', 'Unknown')})\n"
+            else:
+                google_info += "\n⚠️ No credible news sources found with similar content.\n"
+        
         prompt = f"""You are an expert fact-checker and misinformation analyst. Analyze the following news article for authenticity.
 
 Article Content:
 {content[:8000]}
+{google_info}
+
+IMPORTANT: I have performed a REAL-TIME Google Search to verify the claims in this article. The search results above are from the current web, NOT from your training data. Please prioritize these real-time search results when making your determination.
+
+If credible news sources are reporting similar content, give weight to that in your analysis.
 
 Provide a comprehensive analysis in JSON format with the following structure:
 {{
@@ -280,21 +591,24 @@ Provide a comprehensive analysis in JSON format with the following structure:
     "real_probability": float (0-100),
     "red_flags": [list of concerning elements],
     "patterns": [list of patterns detected],
-    "reasoning": "detailed explanation of your analysis",
+    "reasoning": "IMPORTANT: Write in a clear, conversational tone. Focus on WHAT credible sources report and WHY this matters, not technical search metrics. For example: 'Credible sources like BBC do not support this claim. Instead, they report that...' or 'This is widely reported by BBC, Reuters, and others.' Do NOT mention 'Google Search results found', 'credibility ratio', 'total results', or similar technical details. Keep it natural and user-friendly.",
     "key_entities": [list of main people/organizations mentioned]
 }}
 
 Consider:
-1. Writing quality and journalistic standards
-2. Source citations and evidence
-3. Bias and objectivity
-4. Factual accuracy and consistency
-5. Sensationalism and emotional manipulation
-6. Logical fallacies and misleading information
-7. Author credibility
-8. Publication patterns
+1. **Real-time Google Search results** (HIGHEST PRIORITY if available - this is current data from the web)
+2. What credible sources actually say about this topic
+3. Writing quality and journalistic standards
+4. Source citations and evidence
+5. Bias and objectivity
+6. Factual accuracy and consistency
+7. Sensationalism and emotional manipulation
+8. Logical fallacies and misleading information
+9. Author credibility
+10. Publication patterns
 
 Respond ONLY with valid JSON."""
+
 
     try:
         # Call Groq API
@@ -355,8 +669,9 @@ Respond ONLY with valid JSON."""
             fake_prob = 50.0
             real_prob = 50.0
         
-        # Calculate confidence score (0-100) based on how decisive the probabilities are
-        confidence_score = abs(fake_prob - real_prob)
+        # Calculate confidence score (0-100) - use the higher probability as confidence
+        # If 81% fake, we're 81% confident in our verdict (not 62%)
+        confidence_score = max(fake_prob, real_prob)
         
         # Ensure all required fields exist with defaults
         return AnalysisResult(
@@ -407,7 +722,11 @@ async def analyze_news(request: NewsRequest):
             # Extract article from URL with metadata
             content, metadata = await extract_article_from_url(content)
             
-            # Generate summary using AI
+            # Generate TWO summaries using AI:
+            # 1. Short summary (1 sentence) for UI display
+            # 2. Full summary (200 words) for TTS audio
+            
+            # Short summary for UI
             summary_prompt = f"Summarize the following article in one concise sentence (max 150 characters):\n\n{content[:2000]}"
             summary_response = groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": summary_prompt}],
@@ -416,6 +735,29 @@ async def analyze_news(request: NewsRequest):
                 max_tokens=100,
             )
             metadata.summary = summary_response.choices[0].message.content.strip()
+            
+            # Full summary for TTS (200 words)
+            full_summary_prompt = f"""Summarize the following article in 200 words. Make it sound natural for audio narration, like a news anchor would read it. Include the main points, key facts, and important quotes if any.
+
+Article:
+{content[:3000]}
+
+Provide a clear, engaging 200-word summary:"""
+            
+            full_summary_response = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": full_summary_prompt}],
+                model="llama-3.3-70b-versatile",
+                temperature=0.3,
+                max_tokens=400,  # ~200 words = ~400 tokens
+            )
+            full_summary = full_summary_response.choices[0].message.content.strip()
+            
+            # Store full summary separately (we'll use this for TTS)
+            # Add it to metadata as a temporary field
+            if not hasattr(metadata, 'full_summary'):
+                metadata.__dict__['full_summary'] = full_summary
+            else:
+                metadata.full_summary = full_summary
             
             # Get similar articles
             similar_articles = await get_similar_articles(content)
@@ -439,8 +781,79 @@ async def analyze_news(request: NewsRequest):
                 summary=None
             )
         
-        # Analyze with Groq
-        result = await analyze_with_groq(content, input_type, sources)
+        # 🔍 PERFORM REAL-TIME GOOGLE SEARCH VERIFICATION
+        google_verification = None
+        try:
+            # Create search query based on input type
+            if input_type == "title":
+                search_query = content
+            else:
+                # For articles, extract key terms for search
+                # Use first 100 characters or title if available
+                search_query = metadata.title if metadata.title and len(metadata.title) < 200 else content[:100]
+            
+            print(f"🌐 Performing Google Search verification for: {search_query[:100]}...")
+            google_verification = await verify_with_google_search(search_query, max_results=10)
+            print(f"✅ Google Search complete: {google_verification.get('total_results', 0)} results, {google_verification.get('credible_results', 0)} credible sources")
+        except Exception as e:
+            print(f"⚠️ Google Search verification failed (will proceed without it): {str(e)}")
+        
+        # Analyze with Groq (now includes Google verification data)
+        result = await analyze_with_groq(content, input_type, sources, google_verification)
+        
+        # 🎯 SMART VERIFICATION: Override LLM if credible sources confirm the news
+        if google_verification:
+            credible_count = google_verification.get('credible_results', 0)
+            total_results = google_verification.get('total_results', 0)
+            credibility_ratio = google_verification.get('verification_summary', {}).get('credibility_ratio', 0)
+            
+            print(f"📊 Verification Stats - Credible: {credible_count}, Total: {total_results}, Ratio: {credibility_ratio:.2%}")
+            
+            # Strong evidence of REAL news: 3+ credible sources with high ratio
+            if credible_count >= 3 and credibility_ratio >= 0.3:
+                print(f"✅ OVERRIDING LLM: {credible_count} credible sources confirm this news is REAL")
+                result.is_fake = False
+                result.real_probability = min(95.0, 60.0 + (credible_count * 7))  # Scale with credible sources
+                result.fake_probability = 100.0 - result.real_probability
+                result.confidence_score = abs(result.real_probability - result.fake_probability)
+                
+                # Update reasoning to explain the override
+                override_msg = f"\n\n✅ VERIFICATION OVERRIDE: Found {credible_count} credible news sources confirming this story, including: "
+                credible_sources = google_verification.get('credible_sources', [])
+                override_msg += ", ".join([s.get('domain', 'Unknown') for s in credible_sources[:3]])
+                override_msg += f". With a credibility ratio of {credibility_ratio:.0%}, this is confirmed as REAL news."
+                result.reasoning = result.reasoning + override_msg
+                
+                # Add verification note to red flags
+                result.red_flags = [f for f in result.red_flags if f]  # Clear placeholder flags
+                if not result.red_flags or len(result.red_flags) == 0:
+                    result.red_flags = ["Initial analysis suggested concerns, but verification confirmed authenticity"]
+            
+            # Moderate evidence: 1-2 credible sources
+            elif credible_count >= 1 and credible_count < 3:
+                print(f"⚖️ ADJUSTING: {credible_count} credible sources found, adjusting probabilities")
+                # Shift probabilities towards real
+                adjustment = credible_count * 15  # 15% per credible source
+                result.real_probability = min(80.0, result.real_probability + adjustment)
+                result.fake_probability = 100.0 - result.real_probability
+                result.is_fake = result.fake_probability > result.real_probability
+                result.confidence_score = abs(result.real_probability - result.fake_probability)
+                
+                # Update reasoning
+                adjust_msg = f"\n\n⚖️ PROBABILITY ADJUSTED: Found {credible_count} credible source(s) reporting similar information. Adjusted real probability by +{adjustment}%."
+                result.reasoning = result.reasoning + adjust_msg
+            
+            # No credible sources but results exist
+            elif total_results >= 5 and credible_count == 0:
+                print(f"⚠️ WARNING: {total_results} results found but NO credible sources")
+                # Increase fake probability slightly
+                result.fake_probability = min(95.0, result.fake_probability + 10)
+                result.real_probability = 100.0 - result.fake_probability
+                result.is_fake = True
+                result.confidence_score = abs(result.real_probability - result.fake_probability)
+                
+                warning_msg = f"\n\n⚠️ NO CREDIBLE SOURCES: Found {total_results} search results but none from credible news organizations."
+                result.reasoning = result.reasoning + warning_msg
         
         # Add metadata and similar articles to result
         result.article_metadata = metadata
@@ -450,7 +863,42 @@ async def analyze_news(request: NewsRequest):
         if request.enable_features:
             # Merge user selection with config defaults (only truthy keys)
             selection = {k: bool(v) for k, v in request.enable_features.items()}
-            adv = await run_selected_features(content, selection)
+            
+            # For TTS, generate a summary of the ANALYSIS RESULTS (not the article)
+            content_for_features = content
+            if selection.get('tts'):
+                # Create a narration-friendly summary of the analysis
+                verdict_text = "FAKE" if result.is_fake else "REAL"
+                confidence = result.confidence_score
+                
+                analysis_summary = f"""Analysis Complete. 
+
+Verdict: This news is classified as {verdict_text} with {confidence:.0f}% confidence.
+
+Fake probability: {result.fake_probability:.0f}%
+Real probability: {result.real_probability:.0f}%
+
+"""
+                
+                # Add red flags if any
+                if result.red_flags and len(result.red_flags) > 0:
+                    analysis_summary += f"Red flags detected: {len(result.red_flags)} issues found. "
+                    analysis_summary += " ".join(result.red_flags[:3])  # First 3 red flags
+                    analysis_summary += "\n\n"
+                
+                # Add key reasoning
+                if result.reasoning:
+                    # Clean up the reasoning for audio
+                    reasoning_clean = result.reasoning.replace('⚖️', '').replace('✅', '').replace('⚠️', '')
+                    reasoning_clean = reasoning_clean.replace('VERIFICATION OVERRIDE:', '')
+                    reasoning_clean = reasoning_clean.replace('PROBABILITY ADJUSTED:', '')
+                    reasoning_clean = reasoning_clean.replace('NO CREDIBLE SOURCES:', '')
+                    analysis_summary += f"Detailed analysis: {reasoning_clean[:500]}"  # Limit reasoning
+                
+                content_for_features = analysis_summary
+                print(f"🎙️ TTS will read analysis summary ({len(analysis_summary)} chars)")
+            
+            adv = await run_selected_features(content_for_features, selection)
             result.advanced_features = adv
         
         return result

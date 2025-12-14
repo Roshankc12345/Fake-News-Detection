@@ -11,7 +11,6 @@ import asyncio
 import os
 import re
 import json
-import pyttsx3
 import requests
 import torch
 from transformers import pipeline
@@ -91,32 +90,145 @@ def _pipeline_failed(obj: Any) -> bool:
     return isinstance(obj, str) and obj.startswith("pipeline_error:")
 
 
-# --------- TTS (pyttsx3 fallback; offline) ---------
-# Removed lru_cache to avoid state issues causing timeouts
+# --------- TTS (Google Text-to-Speech - works on macOS!) ---------
+
+def _clean_text_for_tts(text: str) -> str:
+    """
+    Balanced cleaning - removes navigation/ads while keeping article content.
+    """
+    import re
+    
+    # Remove URLs and emails
+    text = re.sub(r'http[s]?://\S+', '', text)
+    text = re.sub(r'\S+@\S+', '', text)
+    
+    # Remove obvious noise (but not too aggressive)
+    noise_patterns = [
+        r'click\s+here',
+        r'subscribe\s+now',
+        r'sign\s+up',
+        r'log\s*in',
+        r'(share|follow)\s+(this|us)',
+        r'facebook|twitter|instagram',
+        r'copyright\s+©?\s*\d{4}',
+        r'all\s+rights\s+reserved',
+    ]
+    
+    for pattern in noise_patterns:
+        text = re.sub(pattern, ' ', text, flags=re.IGNORECASE)
+    
+    # Process lines - keep substantial content
+    lines = text.split('\n')
+    content_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Skip very short lines
+        if len(line) < 15:
+            continue
+        
+        # Skip pure dates/numbers
+        if re.match(r'^[\d\s\-/:,°]+$', line):
+            continue
+        
+        # Skip navigation keywords
+        if line.lower().startswith(('menu', 'search', 'login', 'home')):
+            continue
+        
+        # Skip if mostly non-letters
+        alpha_count = sum(c.isalpha() for c in line)
+        if alpha_count < len(line) * 0.4:  # Less than 40% letters
+            continue
+        
+        content_lines.append(line)
+    
+    text = ' '.join(content_lines)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Extract sentences
+    sentences = re.split(r'[.!?]+\s+', text)
+    good_sentences = []
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        
+        # Keep sentences with reasonable length
+        if len(sentence) < 15:  # Lowered threshold
+            continue
+        
+        words = sentence.split()
+        if len(words) < 3:  # Lowered threshold
+            continue
+        
+        # Skip obvious navigation
+        skip_phrases = ['what\'s news', 'most read', 'related news', 'e-paper']
+        if any(phrase in sentence.lower() for phrase in skip_phrases):
+            continue
+        
+        good_sentences.append(sentence)
+    
+    # Take first 30 sentences
+    clean_text = '. '.join(good_sentences[:30])
+    
+    if clean_text and not clean_text.endswith(('.', '!', '?')):
+        clean_text += '.'
+    
+    return clean_text
 
 
 def tts_generate(text: str, speed: float = 1.0, filename: str = "news_audio.mp3") -> Dict[str, Any]:
+    """Generate audio using Google Text-to-Speech (gTTS) - works reliably on all platforms"""
     try:
         import os
-        # Save to audio_files directory (same directory as main.py)
+        from gtts import gTTS
+        
+        # Save to audio_files directory
         backend_dir = os.path.dirname(os.path.abspath(__file__))
         audio_dir = os.path.join(backend_dir, "audio_files")
         os.makedirs(audio_dir, exist_ok=True)
         filepath = os.path.join(audio_dir, filename)
         
-        # Limit text length
-        text = text[:2000] if len(text) > 2000 else text
+        # Clean the text
+        print(f"📝 Original: {len(text)} chars")
+        text = _clean_text_for_tts(text)
+        print(f"✂️ Cleaned: {len(text)} chars")
         
-        # Create fresh engine instance
-        engine = pyttsx3.init()
-        base_rate = engine.getProperty("rate")
-        engine.setProperty("rate", int(base_rate * speed))
-        engine.save_to_file(text, filepath)
-        engine.runAndWait()
-        engine.stop()  # Properly cleanup
-        return {"ok": True, "file": filename, "url": f"/audio/{filename}"}
+        if text and len(text) > 50:
+            print(f"📄 Preview: {text[:150]}...")
+        
+        # Limit length
+        words = text.split()
+        if len(words) > 500:
+            text = ' '.join(words[:500]) + "."
+            print(f"⏱️ Truncated to 500 words")
+        
+        # Validate
+        if not text or len(text.strip()) < 30:
+            return {
+                "ok": False, 
+                "error": "Could not extract article content. Try pasting the article text directly."
+            }
+        
+        # Generate
+        print(f"🎤 Generating audio ({len(words)} words)...")
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts.save(filepath)
+        
+        # Verify
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 100:
+            print(f"✅ Audio: {os.path.getsize(filepath)} bytes")
+            return {"ok": True, "file": filename, "url": f"/audio/{filename}"}
+        else:
+            return {"ok": False, "error": "Audio generation failed"}
+                
+    except ImportError:
+        return {"ok": False, "error": "gTTS not installed. Run: pip install gtts"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        error_msg = str(e)
+        if "connection" in error_msg.lower() or "network" in error_msg.lower():
+            return {"ok": False, "error": "Network error: Check your internet connection"}
+        return {"ok": False, "error": f"TTS error: {error_msg}"}
 
 
 # --------- NER + simple reality check via Wikipedia ---------
@@ -128,6 +240,7 @@ def _get_ner():
 
 
 def _wiki_exists(query: str) -> bool:
+    """Fallback Wikipedia verification"""
     try:
         resp = requests.get(
             "https://en.wikipedia.org/w/api.php",
@@ -138,6 +251,47 @@ def _wiki_exists(query: str) -> bool:
         return bool(data.get("query", {}).get("search"))
     except Exception:
         return False
+
+
+def _verify_entity_google(query: str, entity_type: str) -> dict:
+    """Verify entity using Google Custom Search API"""
+    try:
+        api_key = os.getenv("GOOGLE_CSE_KEY")
+        cx = os.getenv("GOOGLE_CSE_ID")
+        
+        if not api_key or not cx:
+            # Fallback to Wikipedia if no Google credentials
+            return {"verified": _wiki_exists(query), "source": "wikipedia"}
+        
+        # Search Google for the entity
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {"key": api_key, "cx": cx, "q": query, "num": 3}
+        
+        resp = requests.get(url, params=params, timeout=5)
+        if resp.status_code != 200:
+            return {"verified": _wiki_exists(query), "source": "wikipedia"}
+        
+        data = resp.json()
+        items = data.get("items", [])
+        
+        # If we find 2+ results, consider it verified
+        if len(items) >= 2:
+            # Check if results are from credible sources
+            credible_count = 0
+            for item in items:
+                domain = item.get("displayLink", "").lower()
+                if any(d in domain for d in ["wikipedia", ".gov", ".edu", "britannica", "bbc", "reuters", "nationalgeographic"]):
+                    credible_count += 1
+            
+            # If at least 1 credible source, mark as verified
+            if credible_count >= 1:
+                return {"verified": True, "source": "google_search", "results": len(items)}
+        
+        # Fallback to Wikipedia
+        return {"verified": _wiki_exists(query), "source": "wikipedia"}
+    except Exception as e:
+        # Fallback to Wikipedia on any error
+        return {"verified": _wiki_exists(query), "source": "wikipedia"}
 
 
 def ner_reality_checker(text: str) -> Dict[str, Any]:
@@ -183,13 +337,13 @@ def ner_reality_checker(text: str) -> Dict[str, Any]:
             continue
             
         # Clean up text value (sometimes contains leading/trailing punctuation)
-        text_clean = text_val.strip(" .,;:!?")
+        text_clean = text_val.strip(" .,;:!?#")
         if len(text_clean) < 3:
             continue
             
         # Check against common noise words
         exclude_words = {"times", "of", "india", "edition", "english", "business", "news", "desk", 
-                        "today", "market", "stock", "netflix", "bros", "des", "unknown"}
+                        "today", "market", "stock", "netflix", "bros", "des", "unknown", "the", "and"}
         if text_clean.lower() in exclude_words:
             continue
             
@@ -198,25 +352,38 @@ def ner_reality_checker(text: str) -> Dict[str, Any]:
             continue
         seen.add(text_clean.lower())
         
-        # Verify via Wikipedia
-        exists = _wiki_exists(text_clean)
+        # Verify via Google Search (with Wikipedia fallback)
+        verification = _verify_entity_google(text_clean, label)
+        exists = verification.get("verified", False)
+        source = verification.get("source", "unknown")
         
-        entities.append({
-            "text": text_clean,
-            "label": label,
-            "verified": exists,
-            "status": "verified" if exists else "unverified",
-            "source": "wikipedia"
-        })
+        # Only include verified entities to keep it clean
+        if exists:
+            # Create user-friendly status message
+            if source == "google_search":
+                status_msg = "verified via Google"
+            elif source == "wikipedia":
+                status_msg = "verified via Wikipedia"
+            else:
+                status_msg = "verified"
+            
+            entities.append({
+                "text": text_clean,
+                "label": label,
+                "verified": True,
+                "status": status_msg,  # This is what the frontend displays
+                "source": source
+            })
     
-    # Sort: Unverified first (to alert user), then by label, then text
-    entities.sort(key=lambda x: (not x["verified"], x["label"], x["text"]))
+    # Sort: by label, then text
+    entities.sort(key=lambda x: (x["label"], x["text"]))
     
     # Limit to top 10
     entities = entities[:10]
     
-    verified = sum(1 for e in entities if e["verified"])
-    score = int((verified / len(entities)) * 100) if entities else 0
+    # All entities shown are verified (we filtered unverified ones)
+    verified = len(entities)
+    score = 100 if verified > 0 else 0
     
     return {"ok": True, "entities": entities, "credibility_score": score}
 

@@ -956,4 +956,49 @@
   color: #64748b;
 }
 
+/* Microphone button for voice input */
+.micButton {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 10px;
+  background: rgba(49, 234, 200, 0.15);
+  border: 1px solid rgba(49, 234, 200, 0.4);
+  color: rgb(49, 234, 200);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  transition: all 0.2s ease;
+  z-index: 10;
+}
+
+.micButton:hover {
+  background: rgba(49, 234, 200, 0.25);
+  border-color: rgba(49, 234, 200, 0.6);
+  transform: scale(1.05);
+  box-shadow: 0 4px 20px rgba(49, 234, 200, 0.3);
+}
+
+.micButton:active {
+  transform: scale(0.98);
+}
+
+.micButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.micButton:disabled:hover {
+  background: rgba(49, 234, 200, 0.15);
+  border-color: rgba(49, 234, 200, 0.4);
+  transform: none;
+  box-shadow: none;
+}
 

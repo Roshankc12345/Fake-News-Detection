@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Shield,
   AlertTriangle,
@@ -17,6 +17,7 @@ import {
   Eye,
   ChevronRight,
   Volume2,
+  Mic,
 } from 'lucide-react';
 import styles from './page.module.css';
 
@@ -72,6 +73,58 @@ export default function Home() {
     tts: false,
     ner_reality_checker: false,
   });
+  const [isListening, setIsListening] = useState(false);
+
+  // Initialize Speech Recognition
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const SpeechRecognition =
+        (window as any).webkitSpeechRecognition ||
+        (window as any).SpeechRecognition;
+
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.lang = 'en-US';
+        recognition.continuous = false;
+        recognition.interimResults = false;
+
+        recognition.onresult = (event: any) => {
+          const transcript = event.results[0][0].transcript;
+          setContent(transcript);
+          setIsListening(false);
+        };
+
+        recognition.onend = () => {
+          setIsListening(false);
+        };
+
+        recognition.onerror = (event: any) => {
+          console.error('Speech recognition error:', event.error);
+          setError(`Voice input error: ${event.error}`);
+          setIsListening(false);
+        };
+
+        (window as any).voiceRecognition = recognition;
+      }
+    }
+  }, []);
+
+  const toggleVoiceInput = () => {
+    const recognition = (window as any).voiceRecognition;
+
+    if (!recognition) {
+      setError('Speech recognition not supported in this browser. Please use Chrome, Edge, or Safari.');
+      return;
+    }
+
+    if (isListening) {
+      recognition.stop();
+    } else {
+      setError(''); // Clear any previous errors
+      recognition.start();
+      setIsListening(true);
+    }
+  };
 
   const analyzeNews = async () => {
     if (!content.trim()) {
@@ -131,16 +184,10 @@ export default function Home() {
                 Real-time AI Defense
               </p>
               <h1 className={styles.title}>VERITAS Intelligence</h1>
-              <p className={styles.subtitle}>Truth-first analysis powered by Groq + Llama 3.3 70B</p>
+              <p className={styles.subtitle}>Advanced AI-powered news verification system</p>
             </div>
           </div>
-          <div className={styles.headerRight}>
-            <Sparkles />
-            <div>
-              <p className={styles.headerRightTitle}>Lumeo-inspired surface</p>
-              <p className={styles.headerRightSubtitle}>Soft glassmorphism + neon gradients</p>
-            </div>
-          </div>
+
         </header>
 
         {/* Main Grid */}
@@ -195,21 +242,41 @@ export default function Home() {
                 </button>
               </div>
 
-              {/* Input Area */}
+              {/* Input Area with Voice Button */}
               <div className={styles.inputArea}>
-                <textarea
-                  value={content}
-                  onChange={(e) => setContent(e.target.value)}
-                  placeholder={
-                    inputType === 'url'
-                      ? 'Paste article URL...'
-                      : inputType === 'title'
-                        ? 'Enter headline to check...'
-                        : 'Paste full article text...'
-                  }
-                  rows={inputType === 'article' ? 8 : 4}
-                  className={styles.textarea}
-                />
+                <div style={{ position: 'relative' }}>
+                  <textarea
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    placeholder={
+                      inputType === 'url'
+                        ? 'Paste article URL...'
+                        : inputType === 'title'
+                          ? 'Enter headline to check...'
+                          : 'Paste full article text...'
+                    }
+                    rows={inputType === 'article' ? 8 : 4}
+                    className={styles.textarea}
+                  />
+
+                  {/* Microphone Button */}
+                  <button
+                    onClick={toggleVoiceInput}
+                    type="button"
+                    className={styles.micButton}
+                    title={isListening ? 'Stop listening' : 'Click to speak your query'}
+                    disabled={loading}
+                  >
+                    {isListening ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <Mic className="animate-pulse" style={{ width: '18px', height: '18px' }} />
+                        <span style={{ fontSize: '13px' }}>Listening...</span>
+                      </div>
+                    ) : (
+                      <Mic style={{ width: '18px', height: '18px' }} />
+                    )}
+                  </button>
+                </div>
               </div>
 
               {/* Advanced feature toggles */}
@@ -537,8 +604,8 @@ export default function Home() {
                     <Brain />
                   </div>
                   <div>
-                    <p className={styles.featureTitle}>Llama 3.3 70B</p>
-                    <p className={styles.featureSubtitle}>LLM-grade intelligence</p>
+                    <p className={styles.featureTitle}>Advanced AI Model</p>
+                    <p className={styles.featureSubtitle}>Neural network intelligence</p>
                   </div>
                 </div>
                 <div className={styles.featureRow}>
@@ -607,7 +674,7 @@ export default function Home() {
         <footer className={styles.footer}>
           <span className={styles.footerLeft}>
             <Sparkles />
-            Built with Next.js & FastAPI • Powered by Groq AI
+            Advanced Fake News Detection System
           </span>
           <span className={styles.footerRight}>Veritas • 2025</span>
         </footer>
