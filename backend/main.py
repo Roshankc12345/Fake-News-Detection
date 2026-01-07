@@ -849,7 +849,8 @@ Provide a clear, engaging 200-word summary:"""
                 # Increase fake probability slightly
                 result.fake_probability = min(95.0, result.fake_probability + 10)
                 result.real_probability = 100.0 - result.fake_probability
-                result.is_fake = True
+                # Determine verdict based on probabilities (don't force True)
+                result.is_fake = result.fake_probability > result.real_probability
                 result.confidence_score = abs(result.real_probability - result.fake_probability)
                 
                 warning_msg = f"\n\n⚠️ NO CREDIBLE SOURCES: Found {total_results} search results but none from credible news organizations."
