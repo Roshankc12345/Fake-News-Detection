@@ -137,7 +137,8 @@ export default function Home() {
     setResult(null);
 
     try {
-      const response = await fetch('http://localhost:8000/analyze', {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${apiUrl}/analyze`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -500,7 +501,7 @@ export default function Home() {
                       <div className={styles.audioPlayer}>
                         <audio
                           id="news-audio"
-                          src={`http://localhost:8000${result.advanced_features.tts.url}`}
+                          src={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}${result.advanced_features.tts.url}`}
                           controls
                           className={styles.audioElement}
                           preload="auto"
